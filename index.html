@@ -440,6 +440,7 @@ var autocomplete = null;
 var directionsService = null;
 var routeSteps = [];   // Google Directions steps (for exit numbers)
 var routePath = [];    // array of {lat,lng} LatLng objects along full route
+var routeSegStepIdx = []; // maps each path segment to its originating Directions step
 
 function asLatLng(value) {
   if (!value) return null;
@@ -802,6 +803,65 @@ function updateGPSMarker(lat, lng, acc) {
 }
 
 /* ═══ PLAN ROUTE — Google Directions ═══ */
+
+function buildDenseRoutePath(steps) {
+  var dense = [];
+  routeSegStepIdx = [];
+  if (!steps || !steps.length) return dense;
+
+  for (var si = 0; si < steps.length; si++) {
+    var pts = (steps[si] && steps[si].path) ? steps[si].path : [];
+    if (!pts.length) continue;
+    for (var pi = 0; pi < pts.length; pi++) {
+      if (dense.length) {
+        var last = dense[dense.length - 1];
+        if (last.lat() === pts[pi].lat() && last.lng() === pts[pi].lng()) continue;
+      }
+      dense.push(pts[pi]);
+      if (dense.length > 1) routeSegStepIdx[dense.length - 2] = si;
+    }
+  }
+  return dense;
+}
+
+function stripHtml(s) {
+  return (s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function routeLabelTokens(label) {
+  var s = (label || '').toUpperCase();
+  var out = [];
+  var re = /(?:I|US|SR|WA|HWY|STATE ROUTE|ROUTE)\s*-?\s*(\d+[A-Z]?)/g;
+  var m;
+  while ((m = re.exec(s))) out.push(m[1]);
+  return out;
+}
+
+function stepTextWindow(stepIdx, steps) {
+  if (!steps || !steps.length) return '';
+  var from = Math.max(0, stepIdx - 1);
+  var to = Math.min(steps.length - 1, stepIdx + 1);
+  var buf = [];
+  for (var i = from; i <= to; i++) {
+    var st = steps[i] || {};
+    buf.push(stripHtml(st.instructions || ''));
+    if (st.maneuver) buf.push(String(st.maneuver));
+  }
+  return buf.join(' ').toUpperCase();
+}
+
+function routeLabelCompatibleWithStep(routeLabel, stepIdx, steps) {
+  var tokens = routeLabelTokens(routeLabel);
+  if (!tokens.length) return true;
+  var txt = stepTextWindow(stepIdx, steps);
+  for (var i = 0; i < tokens.length; i++) {
+    var n = tokens[i].replace(/[.*+?^${}()|[\]\]/g, '\\$&');
+    var rx = new RegExp('\b(?:I[- ]?' + n + '|INTERSTATE ' + n + '|US[- ]?' + n + '|US HIGHWAY ' + n + '|SR[- ]?' + n + '|STATE ROUTE ' + n + '|ROUTE ' + n + '|HIGHWAY ' + n + ')\b', 'i');
+    if (rx.test(txt)) return true;
+  }
+  return false;
+}
+
 function planRoute() {
   if (!myLat || !destPlace) return;
   var btn = document.getElementById('routeBtn');
@@ -906,7 +966,7 @@ function reroute() {
 function clearRouteData() {
   if (routePolyline) { routePolyline.setMap(null); routePolyline = null; }
   bridgeMarkers.forEach(function(m) { m.setMap(null); }); bridgeMarkers = [];
-  routeBridges = []; routePath = []; routeSteps = [];
+  routeBridges = []; routePath = []; routeSteps = []; routeSegStepIdx = [];
 }
 
 function stopNav() {
@@ -958,7 +1018,7 @@ function stopLiveInterval() {
    Only bridges whose perpendicular snap point falls within
    the route corridor AND direction matches are included.
 ═══════════════════════════════════════════════════ */
-var MAX_DIST_MI = 0.05; // 80m — tight route-only matching
+var MAX_DIST_MI = 0.025; // ~40m, much tighter to reject opposite carriageways
 
 function haverMi(la1, lo1, la2, lo2) {
   var R = 3958.8;
@@ -1059,6 +1119,9 @@ function findBridgesOnRoute(path, steps) {
                           coords[bestSi+1][0],coords[bestSi+1][1]);
     var dir  = headingBucket(bear);
     if (!dirCompatible(br.route, dir)) continue;
+
+    var stepIdx = routeSegStepIdx[bestSi] || 0;
+    if (!routeLabelCompatibleWithStep(br.route, stepIdx, steps)) continue;
 
     var obj = {};
     for (var k in br) obj[k] = br[k];
@@ -1188,14 +1251,25 @@ function liveCheck() {
   }
 
   /* Map path index to segment index — same thing since routePath is dense */
+  function routeDistanceAhead(segIdx) {
+    var sum = 0;
+    if (closestIdx < routePath.length) {
+      sum += haverMi(myLat, myLng, routePath[closestIdx].lat(), routePath[closestIdx].lng());
+    }
+    for (var i = closestIdx; i < segIdx && i < routePath.length - 1; i++) {
+      sum += haverMi(routePath[i].lat(), routePath[i].lng(), routePath[i+1].lat(), routePath[i+1].lng());
+    }
+    return sum;
+  }
+
   var ahead = routeBridges
     .filter(function(b) { return getSev(b)!=='clear' && b.segIdx >= closestIdx; })
     .map(function(b) {
       var obj = {}; for (var k in b) obj[k]=b[k];
-      obj.distMi = haverMi(myLat,myLng,b.lat,b.lng);
+      obj.distMi = routeDistanceAhead(b.segIdx);
       return obj;
     })
-    .sort(function(a,b) { return a.distMi-b.distMi; });
+    .sort(function(a,b) { return a.segIdx-b.segIdx; });
 
   if (ahead.length) {
     var n = ahead[0], s = getSev(n);
