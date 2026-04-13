@@ -117,16 +117,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,200,255,.12)}
 #pac-input:focus{border-color:var(--accent);}
 .dest-ico{position:absolute;left:24px;top:50%;transform:translateY(-60%);font-size:13px;pointer-events:none}
 .action-btns{display:flex;gap:8px;margin-top:8px}
-
-.route-options{display:none;gap:8px;overflow-x:auto;padding-top:8px;-webkit-overflow-scrolling:touch}
-.route-chip{min-width:120px;flex:0 0 auto;background:var(--p2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;cursor:pointer}
-.route-chip.active{border-color:var(--accent);box-shadow:0 0 0 1px rgba(0,200,255,.25) inset}
-.route-chip.safe{border-color:rgba(0,230,118,.55)}
-.route-chip.blocked{border-color:rgba(255,51,51,.55)}
-.route-chip .r1{font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--accent)}
-.route-chip .r2{font-size:11px;color:var(--text);font-weight:700;margin-top:2px}
-.route-chip .r3{font-size:10px;color:var(--muted);margin-top:2px}
-.traffic-pill{display:inline-block;margin-left:6px;padding:1px 5px;border-radius:10px;font-size:9px;border:1px solid var(--border);color:var(--orange)}
 .btn{
   flex:1;padding:13px 6px;border:none;border-radius:8px;cursor:pointer;
   font-family:'Rajdhani',sans-serif;font-weight:700;font-size:14px;
@@ -347,7 +337,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,200,255,.12)}
       <button class="btn btn-gps" id="gpsBtn" onclick="startGPS()">&#x1F4E1; MY LOCATION</button>
       <button class="btn btn-route" id="routeBtn" onclick="planRoute()" disabled>&#x25B6; GO</button>
     </div>
-    <div id="routeOptions" class="route-options"></div>
   </div>
 
   <!-- LIVE SECTION -->
@@ -357,7 +346,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,200,255,.12)}
       <button class="btn btn-reroute" id="rerouteBtn" onclick="reroute()">&#x1F504; REROUTE</button>
       <button class="btn btn-center" onclick="centerOnGPS()">&#x1F3AF; CENTER</button>
     </div>
-    <div id="liveRouteOptions" class="route-options" style="display:flex;padding:10px 14px 0"></div>
 
     <!-- NEXT BRIDGE CARD -->
     <div class="nb-card" id="nbCard">
@@ -438,12 +426,6 @@ var routeBridges = [];
 var alertedIds = new Set();
 var gpsMarker = null, gpsAccCircle = null;
 var routePolyline = null;
-var altRoutePolylines = [];
-var routeCandidates = [];
-var selectedRouteIdx = 0;
-var currentLeg = null;
-var lastRouteRequestAt = 0;
-var autoRerouteTimer = null;
 var bridgeMarkers = [];
 var drawerMin = false;
 var wakeLock = null;
@@ -456,7 +438,6 @@ var gpsWatchId = null;
 var gmap = null;
 var autocomplete = null;
 var directionsService = null;
-var trafficLayer = null;
 var routeSteps = [];   // Google Directions steps (for exit numbers)
 var routePath = [];    // array of {lat,lng} LatLng objects along full route
 var routeSegStepIdx = []; // maps each path segment to its originating Directions step
@@ -547,8 +528,6 @@ function initMap() {
 
 
     directionsService = new google.maps.DirectionsService();
-    trafficLayer = new google.maps.TrafficLayer();
-    trafficLayer.setMap(gmap);
 
     function hideLoader() {
       var loader = document.getElementById('mapLoading');
@@ -888,14 +867,67 @@ function planRoute() {
   var btn = document.getElementById('routeBtn');
   btn.disabled = true; btn.textContent = 'Routing...';
   clearRouteData();
-  routeRequest(true, function(result, status) {
+
+  var origin = new google.maps.LatLng(myLat, myLng);
+  var destination = destPlace.geometry.location;
+  // Handle both LatLng object and plain {lat,lng}
+  if (destination && typeof destination.lat === 'number') {
+    destination = new google.maps.LatLng(destination.lat, destination.lng);
+  }
+
+  directionsService.route({
+    origin: origin,
+    destination: destination,
+    travelMode: google.maps.TravelMode.DRIVING,
+    provideRouteAlternatives: false
+  }, function(result, status) {
     btn.disabled = false; btn.innerHTML = '&#x25B6; GO';
     if (status !== 'OK') {
       alert('Routing failed: ' + status + '. Check destination and try again.');
       return;
     }
-    lastRouteRequestAt = Date.now();
-    processRoutesResult(result, true);
+
+    var route = result.routes[0];
+    var leg   = route.legs[0];
+
+    /* Store steps for exit number lookup */
+    routeSteps = leg.steps;
+
+    /* Build dense path array from overview polyline */
+    routePath = buildDenseRoutePath(route);
+
+    /* Draw route polyline */
+    routePolyline = new google.maps.Polyline({
+      path: routePath,
+      map: gmap,
+      strokeColor: '#00c8ff',
+      strokeWeight: 5,
+      strokeOpacity: 0.85,
+      zIndex: 2
+    });
+
+    /* Find bridges strictly on this route */
+    routeBridges = findBridgesOnRoute(routePath, routeSteps);
+    alertedIds.clear();
+    plotBridges();
+    renderList();
+
+    /* Fit map to route */
+    var bounds = new google.maps.LatLngBounds();
+    routePath.forEach(function(p) { bounds.extend(p); });
+    gmap.fitBounds(bounds, {top:60, bottom:300, left:20, right:20});
+
+    document.getElementById('destSection').style.display = 'none';
+    document.getElementById('liveSection').style.display = 'block';
+    document.getElementById('legend').style.display = 'block';
+
+    /* Distance to destination */
+    document.getElementById('stDst').textContent =
+      (leg.distance.value / 1609.34).toFixed(1);
+
+    requestWakeLock();
+    startLiveInterval();
+    liveCheck();
   });
 }
 
@@ -905,20 +937,36 @@ function reroute() {
   var btn = document.getElementById('rerouteBtn');
   btn.disabled = true; btn.textContent = 'Routing...';
   clearRouteData();
-  routeRequest(true, function(result, status) {
+
+  directionsService.route({
+    origin: new google.maps.LatLng(myLat, myLng),
+    destination: asLatLng(destPlace.geometry.location) || destPlace.geometry.location,
+    travelMode: google.maps.TravelMode.DRIVING
+  }, function(result, status) {
     btn.disabled = false; btn.innerHTML = '&#x1F504; REROUTE';
     if (status !== 'OK') { alert('Reroute failed.'); return; }
-    lastRouteRequestAt = Date.now();
-    processRoutesResult(result, true);
+    var route = result.routes[0];
+    routeSteps = route.legs[0].steps;
+    routePath  = buildDenseRoutePath(route);
+    routePolyline = new google.maps.Polyline({
+      path: routePath, map: gmap,
+      strokeColor:'#00c8ff', strokeWeight:5, strokeOpacity:.85, zIndex:2
+    });
+    routeBridges = findBridgesOnRoute(routePath, routeSteps);
+    alertedIds.clear();
+    plotBridges(); renderList(); liveCheck();
+    var bounds = new google.maps.LatLngBounds();
+    routePath.forEach(function(p) { bounds.extend(p); });
+    gmap.fitBounds(bounds, {top:60,bottom:300,left:20,right:20});
+    requestWakeLock();
+    startLiveInterval();
   });
 }
 
 function clearRouteData() {
   if (routePolyline) { routePolyline.setMap(null); routePolyline = null; }
   bridgeMarkers.forEach(function(m) { m.setMap(null); }); bridgeMarkers = [];
-  routeBridges = []; routePath = []; routeSteps = []; routeSegStepIdx = []; routeCandidates = []; currentLeg = null; selectedRouteIdx = 0; clearRoutePolylines();
-  var a=document.getElementById('routeOptions'); if(a){a.innerHTML='';a.style.display='none';}
-  var b=document.getElementById('liveRouteOptions'); if(b){b.innerHTML='';b.style.display='none';}
+  routeBridges = []; routePath = []; routeSteps = []; routeSegStepIdx = [];
 }
 
 function stopNav() {
@@ -927,7 +975,6 @@ function stopNav() {
   dismissToast();
   releaseWakeLock();
   stopLiveInterval();
-  stopAutoReroute();
   if (gpsWatchId != null) { navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; }
   document.getElementById('flash').style.display = 'none';
   document.getElementById('nbCard').style.display = 'none';
@@ -1172,7 +1219,7 @@ function renderList() {
   }
   list.innerHTML = alerts.map(function(b, i) {
     var s   = getSev(b);
-    var dis = (typeof b.distMi === 'number') ? b.distMi.toFixed(1)+' mi' : (myLat ? haverMi(myLat,myLng,b.lat,b.lng).toFixed(1)+' mi' : '--');
+    var dis = myLat ? haverMi(myLat,myLng,b.lat,b.lng).toFixed(1)+' mi' : '--';
     var ri  = routeBridges.indexOf(b);
     var exitHtml = b.exitInfo ? '<div class="a-exit">&#x1F6A6; ' + b.exitInfo + '</div>' : '';
     return '<div class="a-item" onclick="showInfoWindowByIdx('+ri+')">'
@@ -1215,10 +1262,6 @@ function liveCheck() {
     return sum;
   }
 
-  routeBridges.forEach(function(b){
-    b.distMi = (b.segIdx >= closestIdx) ? routeDistanceAhead(b.segIdx) : -1;
-  });
-
   var ahead = routeBridges
     .filter(function(b) { return getSev(b)!=='clear' && b.segIdx >= closestIdx; })
     .map(function(b) {
@@ -1226,7 +1269,7 @@ function liveCheck() {
       obj.distMi = routeDistanceAhead(b.segIdx);
       return obj;
     })
-    .sort(function(a,b) { return a.distMi-b.distMi; });
+    .sort(function(a,b) { return a.segIdx-b.segIdx; });
 
   if (ahead.length) {
     var n = ahead[0], s = getSev(n);
@@ -1295,9 +1338,6 @@ function liveCheck() {
     document.getElementById('flash').style.display  = 'none';
   }
 
-  if (currentLeg && currentLeg.distance && currentLeg.distance.value) {
-    document.getElementById('stDst').textContent = (currentLeg.distance.value/1609.34).toFixed(1);
-  }
   renderList();
 }
 
@@ -1421,195 +1461,4 @@ function gm_authFailure() {
   src="https://maps.googleapis.com/maps/api/js?key=AIzaSyByn9WxmfppI3pzXKlWz6PAuGgcx4DftUs&v=weekly&libraries=places&callback=initMap"
   async defer></script>
 </body>
-</html
-function buildRequestOptions(origin, destination, includeAlternatives) {
-  return {
-    origin: origin,
-    destination: destination,
-    travelMode: google.maps.TravelMode.DRIVING,
-    provideRouteAlternatives: !!includeAlternatives,
-    drivingOptions: {
-      departureTime: new Date(),
-      trafficModel: google.maps.TrafficModel.BEST_GUESS
-    }
-  };
-}
-
-function summarizeCandidate(route, index) {
-  var leg = route.legs[0];
-  var path = buildDenseRoutePath(route);
-  var steps = leg.steps || [];
-  var bridges = findBridgesOnRoute(path, steps);
-  var crits = bridges.filter(function(b){ return getSev(b)==='crit'; }).length;
-  var warns = bridges.filter(function(b){ return getSev(b)==='warn'; }).length;
-  var durSec = (leg.duration_in_traffic && leg.duration_in_traffic.value) || (leg.duration && leg.duration.value) || 0;
-  return {
-    idx: index,
-    route: route,
-    leg: leg,
-    path: path,
-    steps: steps,
-    bridges: bridges,
-    crits: crits,
-    warns: warns,
-    safe: crits === 0,
-    durationSec: durSec,
-    durationText: (leg.duration_in_traffic && leg.duration_in_traffic.text) || (leg.duration && leg.duration.text) || '--',
-    distanceText: (leg.distance && leg.distance.text) || '--',
-    summary: (route.summary || ('Route ' + (index+1)))
-  };
-}
-
-function chooseBestCandidate(cands) {
-  if (!cands.length) return -1;
-  var safe = cands.filter(function(c){ return c.safe; }).sort(function(a,b){ return a.durationSec - b.durationSec; });
-  if (safe.length) return safe[0].idx;
-  var fallback = cands.slice().sort(function(a,b){
-    if (a.crits !== b.crits) return a.crits - b.crits;
-    if (a.warns !== b.warns) return a.warns - b.warns;
-    return a.durationSec - b.durationSec;
-  });
-  return fallback[0].idx;
-}
-
-function clearRoutePolylines() {
-  if (routePolyline) { routePolyline.setMap(null); routePolyline = null; }
-  altRoutePolylines.forEach(function(p){ try{ p.setMap(null); }catch(e){} });
-  altRoutePolylines = [];
-}
-
-function drawCandidatePolylines() {
-  clearRoutePolylines();
-  routeCandidates.forEach(function(c, idx){
-    var active = idx === selectedRouteIdx;
-    var color = active ? (c.safe ? '#00c8ff' : '#ff3333') : (c.safe ? '#2d6f7d' : '#6b3a3a');
-    var opacity = active ? 0.9 : 0.45;
-    var weight = active ? 6 : 4;
-    var poly = new google.maps.Polyline({
-      path: c.path,
-      map: gmap,
-      strokeColor: color,
-      strokeWeight: weight,
-      strokeOpacity: opacity,
-      zIndex: active ? 4 : 2
-    });
-    if (active) routePolyline = poly; else altRoutePolylines.push(poly);
-  });
-}
-
-function renderRouteOptions() {
-  var html = routeCandidates.map(function(c, idx){
-    var cls = 'route-chip ' + (idx===selectedRouteIdx ? 'active ' : '') + (c.safe ? 'safe' : 'blocked');
-    var status = c.safe ? 'SAFE' : ('BLOCKED ' + c.crits);
-    var trafficLabel = c.leg.duration_in_traffic ? '<span class="traffic-pill">TRAFFIC</span>' : '';
-    return '<div class="'+cls+'" onclick="selectRouteCandidate('+idx+')">'
-      + '<div class="r1">ROUTE ' + (idx+1) + ' ' + trafficLabel + '</div>'
-      + '<div class="r2">' + escapeHtml(c.durationText) + ' · ' + escapeHtml(c.distanceText) + '</div>'
-      + '<div class="r3">' + status + (c.warns ? (' · WARN ' + c.warns) : '') + '</div>'
-      + '</div>';
-  }).join('');
-  var a = document.getElementById('routeOptions');
-  var b = document.getElementById('liveRouteOptions');
-  if (a) { a.innerHTML = html; a.style.display = routeCandidates.length ? 'flex' : 'none'; }
-  if (b) { b.innerHTML = html; b.style.display = routeCandidates.length ? 'flex' : 'none'; }
-}
-
-function applyCandidate(idx, fit) {
-  if (!routeCandidates[idx]) return;
-  selectedRouteIdx = idx;
-  var c = routeCandidates[idx];
-  routeSteps = c.steps;
-  currentLeg = c.leg;
-  routePath = c.path;
-  routeBridges = c.bridges;
-  alertedIds.clear();
-  drawCandidatePolylines();
-  plotBridges();
-  renderRouteOptions();
-  renderList();
-  if (fit !== false) {
-    var bounds = new google.maps.LatLngBounds();
-    routePath.forEach(function(p){ bounds.extend(p); });
-    gmap.fitBounds(bounds, {top:60, bottom:300, left:20, right:20});
-  }
-  document.getElementById('stDst').textContent = ((c.leg.distance && c.leg.distance.value) ? (c.leg.distance.value / 1609.34).toFixed(1) : '--');
-  liveCheck();
-  if (!c.safe) {
-    fireStatusToast('No fully safe route found for a ' + truckH.toFixed(1) + ' ft truck. Showing best available route with ' + c.crits + ' blocking bridge' + (c.crits>1?'s':'') + '.');
-  } else {
-    fireStatusToast('Safe route selected for ' + truckH.toFixed(1) + ' ft truck. ETA ' + c.durationText + '.');
-  }
-}
-
-function selectRouteCandidate(idx) {
-  applyCandidate(idx, true);
-}
-
-function fireStatusToast(msg) {
-  var t = document.getElementById('toast');
-  document.getElementById('tInner').className = 'ti warn';
-  document.getElementById('tTitle').textContent = 'ROUTE UPDATE';
-  document.getElementById('tClr').textContent = 'INFO';
-  document.getElementById('tExit').textContent = '';
-  document.getElementById('tBody').innerHTML = escapeHtml(msg);
-  t.style.display = 'block';
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(function(){ dismissToast(); }, 3200);
-}
-
-function escapeHtml(s) {
-  return String(s||'').replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; });
-}
-
-function processRoutesResult(result, fitBoundsNow) {
-  routeCandidates = (result.routes || []).map(summarizeCandidate);
-  if (!routeCandidates.length) {
-    alert('No routes returned.');
-    return;
-  }
-  var bestIdx = chooseBestCandidate(routeCandidates);
-  renderRouteOptions();
-  applyCandidate(bestIdx, fitBoundsNow !== false);
-  document.getElementById('destSection').style.display = 'none';
-  document.getElementById('liveSection').style.display = 'block';
-  document.getElementById('legend').style.display = 'block';
-  requestWakeLock();
-  startLiveInterval();
-  startAutoReroute();
-}
-
-function routeRequest(includeAlternatives, onDone) {
-  if (!myLat || !destPlace) return;
-  var origin = new google.maps.LatLng(myLat, myLng);
-  var destination = asLatLng(destPlace.geometry.location) || destPlace.geometry.location;
-  directionsService.route(buildRequestOptions(origin, destination, includeAlternatives), onDone);
-}
-
-function startAutoReroute() {
-  stopAutoReroute();
-  autoRerouteTimer = setInterval(function(){
-    if (!myLat || !destPlace) return;
-    var now = Date.now();
-    if (now - lastRouteRequestAt < 30000) return;
-    routeRequest(true, function(result, status){
-      if (status !== 'OK') return;
-      lastRouteRequestAt = Date.now();
-      var prevIdx = selectedRouteIdx;
-      var prevSafe = routeCandidates[prevIdx] ? routeCandidates[prevIdx].safe : false;
-      routeCandidates = (result.routes || []).map(summarizeCandidate);
-      if (!routeCandidates.length) return;
-      var bestIdx = chooseBestCandidate(routeCandidates);
-      renderRouteOptions();
-      if (bestIdx !== prevIdx || (!prevSafe && routeCandidates[bestIdx].safe)) {
-        applyCandidate(bestIdx, false);
-      } else {
-        drawCandidatePolylines();
-      }
-    });
-  }, 60000);
-}
-
-function stopAutoReroute() {
-  if (autoRerouteTimer) { clearInterval(autoRerouteTimer); autoRerouteTimer = null; }
-}
->
+</html>
